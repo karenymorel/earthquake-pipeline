@@ -2,3 +2,4 @@
 
 requests
 apache-airflow-providers-amazon
+duckdb
