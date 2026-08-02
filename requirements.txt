@@ -2,4 +2,4 @@
 
 requests
 apache-airflow-providers-amazon
-duckdb
+duckdb==1.5.4
