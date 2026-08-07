@@ -16,13 +16,12 @@ default_args = {
 @dag(
     dag_id='earthquake_api_to_s3_v1',
     default_args=default_args,
-    description='Pipeline ETL: API USGS -> AWS S3 -> MotherDuck',
+    description='Pipeline ETL Medallion: API USGS -> S3 (Bronze) -> MotherDuck (Silver/Gold)',
     schedule='@daily',
     start_date=datetime(2025, 1, 1),
     catchup=False,
-    tags=['earthquake', 's3', 'motherduck', 'etl']
+    tags=['earthquake', 's3', 'motherduck', 'etl', 'gold']
 )
-
 def earthquake_pipeline():
 
     @task()
@@ -48,11 +47,10 @@ def earthquake_pipeline():
             bucket_name=BUCKET_NAME,
             replace=True
         )
-        print(f"✅ ¡Éxito! Archivo subido en: s3://{BUCKET_NAME}/{s3_key}")
+        print(f"✅ ¡Éxito! Archivo subido en Bronze: s3://{BUCKET_NAME}/{s3_key}")
 
     @task()
-    def load_to_motherduck(data: dict):
-
+    def load_to_motherduck_silver(data: dict):
         print("Aplanando datos JSON con Pandas...")
         features = data.get('features', [])
         
@@ -72,22 +70,54 @@ def earthquake_pipeline():
             })
         
         df = pd.DataFrame(flat_data)
-
         df['timestamp'] = pd.to_datetime(df['time_epoch'], unit='ms')
         
-        print("Conectando a MotherDuck...")
         md_token = Variable.get("motherduck_token")
         con = duckdb.connect(f'md:earthquakes_dw?motherduck_token={md_token}')
         
-        print("Creando tabla silver_earthquakes...")
+        print("Cargando tabla silver_earthquakes...")
         con.execute("CREATE OR REPLACE TABLE silver_earthquakes AS SELECT * FROM df")
-        
-        print(f"✅ ¡Éxito! {len(df)} registros cargados en MotherDuck.")
         con.close()
+        print(f"✅ ¡Éxito! {len(df)} registros cargados en Capa Silver.")
+
+    @task()
+    def create_gold_layer():
+        print("Generando agregaciones para la Capa Gold en MotherDuck...")
+        md_token = Variable.get("motherduck_token")
+        con = duckdb.connect(f'md:earthquakes_dw?motherduck_token={md_token}')
+        
+        # Tabla Gold 1: Métricas diarias resumidas
+        con.execute("""
+            CREATE OR REPLACE TABLE gold_daily_summary AS
+            SELECT 
+                CAST(timestamp AS DATE) as event_date,
+                COUNT(*) as total_earthquakes,
+                ROUND(AVG(magnitude), 2) as avg_magnitude,
+                MAX(magnitude) as max_magnitude,
+                ROUND(AVG(depth), 2) as avg_depth_km
+            FROM silver_earthquakes
+            GROUP BY 1;
+        """)
+
+        # Tabla Gold 2: Sismos de alta intensidad
+        con.execute("""
+            CREATE OR REPLACE TABLE gold_high_intensity_events AS
+            SELECT 
+                id, place, magnitude, depth, latitude, longitude, timestamp
+            FROM silver_earthquakes
+            WHERE magnitude >= 2.5
+            ORDER BY magnitude DESC;
+        """)
+
+        con.close()
+        print("✅ Capa Gold creada exitosamente (gold_daily_summary y gold_high_intensity_events).")
 
     raw_json = extract_earthquake_data()
     
-    upload_to_s3(raw_json)
-    load_to_motherduck(raw_json)
+    upload_s3_task = upload_to_s3(raw_json)
+    silver_task = load_to_motherduck_silver(raw_json)
+    
+    gold_task = create_gold_layer()
+    silver_task >> gold_task
 
 earthquake_pipeline()
