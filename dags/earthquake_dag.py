@@ -43,12 +43,6 @@ def earthquake_pipeline():
         )
 
     @task()
-    def gold_daily_summary_task():
-        md_token = Variable.get("motherduck_token")
-        sql_path = os.path.join(BASE_DIR, 'src', 'sql', 'gold_daily_summary.sql')
-        execute_gold_query(sql_file_path=sql_path, md_token=md_token)
-
-    @task()
     def gold_high_intensity_task():
         md_token = Variable.get("motherduck_token")
         sql_path = os.path.join(BASE_DIR, 'src', 'sql', 'gold_high_intensity.sql')
@@ -58,9 +52,8 @@ def earthquake_pipeline():
     raw_s3_key = bronze_task()
     silver_step = silver_task(raw_s3_key)
     
-    gold_summary = gold_daily_summary_task()
     gold_high = gold_high_intensity_task()
 
-    silver_step >> [gold_summary, gold_high]
+    silver_step >> gold_high
 
 earthquake_pipeline()
