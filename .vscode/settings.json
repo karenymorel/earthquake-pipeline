@@ -1,0 +1,14 @@
+{
+  "files.exclude": {
+    "**/.git": true,
+    "**/.svn": true,
+    "**/.hg": true,
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true,
+    ".aider.tags.cache.v4": true,
+    ".aider.chat.history.md": true,
+    ".aider.input.history": true,
+    ".aider.conf.yml": true
+  },
+  "hide-files.files": [".aider.tags.cache.v4", ".aider.chat.history.md", ".aider.input.history", ".aider.conf.yml"]
+}

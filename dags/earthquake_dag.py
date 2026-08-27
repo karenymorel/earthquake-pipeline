@@ -1,11 +1,16 @@
-import json
-import requests
-import pandas as pd
-import duckdb
+import os
+import sys
 from datetime import datetime, timedelta
 from airflow.decorators import dag, task
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.models import Variable
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from src.extract import extract_and_upload_to_bronze
+from src.load import transform_and_load_silver, execute_gold_query
+
+BUCKET_NAME = "earthquake-data-bronze"
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 default_args = {
     'owner': 'karen_morel',
@@ -14,110 +19,48 @@ default_args = {
 }
 
 @dag(
-    dag_id='earthquake_api_to_s3_v1',
+    dag_id='earthquake_medallion_pipeline_v1',
     default_args=default_args,
-    description='Pipeline ETL Medallion: API USGS -> S3 (Bronze) -> MotherDuck (Silver/Gold)',
+    description='ETL Medallion: API USGS -> S3 (Bronze) -> MotherDuck (Silver/Gold)',
     schedule='@daily',
     start_date=datetime(2025, 1, 1),
     catchup=False,
-    tags=['earthquake', 's3', 'motherduck', 'etl', 'gold']
+    tags=['earthquake', 's3', 'motherduck', 'etl', 'gold', 'medallion']
 )
 def earthquake_pipeline():
 
     @task()
-    def extract_earthquake_data():
-        url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson"
-        print(f"Pidiendo datos a la API: {url}")
-        
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
+    def bronze_task() -> str:
+        return extract_and_upload_to_bronze(bucket_name=BUCKET_NAME)
 
     @task()
-    def upload_to_s3(data: dict):
-        BUCKET_NAME = "earthquake-data-bronze" 
-        
-        now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        s3_key = f"raw/earthquakes_{now_str}.json"
-        
-        s3_hook = S3Hook(aws_conn_id='aws_default')
-        s3_hook.load_string(
-            string_data=json.dumps(data, indent=2),
-            key=s3_key,
+    def silver_task(s3_key: str):
+        md_token = Variable.get("motherduck_token")
+        transform_and_load_silver(
+            s3_key=s3_key,
             bucket_name=BUCKET_NAME,
-            replace=True
+            md_token=md_token
         )
-        print(f"✅ ¡Éxito! Archivo subido en Bronze: s3://{BUCKET_NAME}/{s3_key}")
 
     @task()
-    def load_to_motherduck_silver(data: dict):
-        print("Aplanando datos JSON con Pandas...")
-        features = data.get('features', [])
-        
-        flat_data = []
-        for f in features:
-            props = f.get('properties', {})
-            geom = f.get('geometry', {}).get('coordinates', [None, None, None])
-            
-            flat_data.append({
-                'id': f.get('id'),
-                'magnitude': props.get('mag'),
-                'place': props.get('place'),
-                'time_epoch': props.get('time'),
-                'longitude': geom[0] if len(geom) > 0 else None,
-                'latitude': geom[1] if len(geom) > 1 else None,
-                'depth': geom[2] if len(geom) > 2 else None
-            })
-        
-        df = pd.DataFrame(flat_data)
-        df['timestamp'] = pd.to_datetime(df['time_epoch'], unit='ms')
-        
+    def gold_daily_summary_task():
         md_token = Variable.get("motherduck_token")
-        con = duckdb.connect(f'md:earthquakes_dw?motherduck_token={md_token}')
-        
-        print("Cargando tabla silver_earthquakes...")
-        con.execute("CREATE OR REPLACE TABLE silver_earthquakes AS SELECT * FROM df")
-        con.close()
-        print(f"✅ ¡Éxito! {len(df)} registros cargados en Capa Silver.")
+        sql_path = os.path.join(BASE_DIR, 'src', 'sql', 'gold_daily_summary.sql')
+        execute_gold_query(sql_file_path=sql_path, md_token=md_token)
 
     @task()
-    def create_gold_layer():
-        print("Generando agregaciones para la Capa Gold en MotherDuck...")
+    def gold_high_intensity_task():
         md_token = Variable.get("motherduck_token")
-        con = duckdb.connect(f'md:earthquakes_dw?motherduck_token={md_token}')
-        
-        # Tabla Gold 1: Métricas diarias resumidas
-        con.execute("""
-            CREATE OR REPLACE TABLE gold_daily_summary AS
-            SELECT 
-                CAST(timestamp AS DATE) as event_date,
-                COUNT(*) as total_earthquakes,
-                ROUND(AVG(magnitude), 2) as avg_magnitude,
-                MAX(magnitude) as max_magnitude,
-                ROUND(AVG(depth), 2) as avg_depth_km
-            FROM silver_earthquakes
-            GROUP BY 1;
-        """)
+        sql_path = os.path.join(BASE_DIR, 'src', 'sql', 'gold_high_intensity.sql')
+        execute_gold_query(sql_file_path=sql_path, md_token=md_token)
 
-        # Tabla Gold 2: Sismos de alta intensidad
-        con.execute("""
-            CREATE OR REPLACE TABLE gold_high_intensity_events AS
-            SELECT 
-                id, place, magnitude, depth, latitude, longitude, timestamp
-            FROM silver_earthquakes
-            WHERE magnitude >= 2.5
-            ORDER BY magnitude DESC;
-        """)
-
-        con.close()
-        print("✅ Capa Gold creada exitosamente (gold_daily_summary y gold_high_intensity_events).")
-
-    raw_json = extract_earthquake_data()
+    # Definición de dependencias
+    raw_s3_key = bronze_task()
+    silver_step = silver_task(raw_s3_key)
     
-    upload_s3_task = upload_to_s3(raw_json)
-    silver_task = load_to_motherduck_silver(raw_json)
-    
-    gold_task = create_gold_layer()
-    silver_task >> gold_task
+    gold_summary = gold_daily_summary_task()
+    gold_high = gold_high_intensity_task()
+
+    silver_step >> [gold_summary, gold_high]
 
 earthquake_pipeline()
